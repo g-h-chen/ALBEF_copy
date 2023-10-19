@@ -76,6 +76,7 @@ class ALBEF(nn.Module):
         self.copy_params()
 
         # create the queue
+        # not model parameters but model states, so we use buffer instead of self.xxx 
         self.register_buffer("image_queue", torch.randn(embed_dim, self.queue_size))
         self.register_buffer("text_queue", torch.randn(embed_dim, self.queue_size))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))  
@@ -88,7 +89,8 @@ class ALBEF(nn.Module):
     def forward(self, image, text, alpha=0):
         with torch.no_grad():
             self.temp.clamp_(0.001,0.5)
-        
+
+        ###============ITC================###
         image_embeds = self.visual_encoder(image) 
         image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)
 
@@ -102,21 +104,28 @@ class ALBEF(nn.Module):
         # get momentum features
         with torch.no_grad():
             self._momentum_update()
-            image_embeds_m = self.visual_encoder_m(image) 
-            image_feat_m = F.normalize(self.vision_proj_m(image_embeds_m[:,0,:]),dim=-1)  
-            image_feat_all = torch.cat([image_feat_m.t(),self.image_queue.clone().detach()],dim=1)                                         
+
+            image_embeds_m = self.visual_encoder_m(image) # the momentum features of *current* batch
+            image_feat_m = F.normalize(self.vision_proj_m(image_embeds_m[:,0,:]),dim=-1) 
+            # concat the mmt features with the image queue
+            # the features in image queue are from the most recent (previous) batches
+            image_feat_all = torch.cat([image_feat_m.t(),self.image_queue.clone().detach()],dim=1) 
+
             text_output_m = self.text_encoder_m.bert(text.input_ids, attention_mask = text.attention_mask,                      
                                                 return_dict = True, mode = 'text')    
             text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:,0,:]),dim=-1) 
             text_feat_all = torch.cat([text_feat_m.t(),self.text_queue.clone().detach()],dim=1)
 
+            # mmt and queue comprise soft labels 
             sim_i2t_m = image_feat_m @ text_feat_all / self.temp 
             sim_t2i_m = text_feat_m @ image_feat_all / self.temp     
 
+            # hard labels
             sim_targets = torch.zeros(sim_i2t_m.size()).to(image.device)
             sim_targets.fill_diagonal_(1)          
 
-            sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets
+            # mix up the soft and hard labels 
+            sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets 
             sim_t2i_targets = alpha * F.softmax(sim_t2i_m, dim=1) + (1 - alpha) * sim_targets        
 
         sim_i2t = image_feat @ text_feat_all / self.temp 
@@ -129,7 +138,7 @@ class ALBEF(nn.Module):
 
         self._dequeue_and_enqueue(image_feat_m, text_feat_m)
 
-        ###=================================###
+        ###============ITM================###
         # forward the positve image-text pair
         output_pos = self.text_encoder.bert(encoder_embeds = text_embeds, 
                                         attention_mask = text.attention_mask,
@@ -157,9 +166,9 @@ class ALBEF(nn.Module):
         text_embeds_neg = []
         text_atts_neg = []
         for b in range(bs):
-            neg_idx = torch.multinomial(weights_i2t[b], 1).item()
+            neg_idx = torch.multinomial(weights_i2t[b], 1).item() # sample a *hard* negative
             text_embeds_neg.append(text_embeds[neg_idx])
-            text_atts_neg.append(text.attention_mask[neg_idx])
+            text_atts_neg.append(text.attention_mask[neg_idx]) 
         text_embeds_neg = torch.stack(text_embeds_neg,dim=0)   
         text_atts_neg = torch.stack(text_atts_neg,dim=0)      
 
@@ -181,7 +190,7 @@ class ALBEF(nn.Module):
         vl_output = self.itm_head(vl_embeddings)            
 
         itm_labels = torch.cat([torch.ones(bs,dtype=torch.long),torch.zeros(2*bs,dtype=torch.long)],
-                               dim=0).to(image.device)
+                               dim=0).to(image.device) # bs pos, 2*bs neg
         loss_itm = F.cross_entropy(vl_output, itm_labels)     
         
         ##================= MLM ========================##                
